@@ -1,0 +1,22 @@
+Anonymous supplementary code layout
+=====================================
+
+Files:
+  load_config.py              — JSON -> namespace helper
+  sac3.py                     — SAC (former SAC3.py); requires --config
+  ppo2.py                     — PPO; requires --config
+  sac3_config.example.json    — copy and edit all fields for your run
+  ppo2_config.example.json    — same for PPO
+
+Run from this directory:
+
+  python sac3.py --config sac3_config.example.json
+  python ppo2.py --config ppo2_config.example.json
+
+Set "output_dir" in JSON to an empty or new folder for checkpoints and CSV logs.
+Set "device" to "cpu" or "cuda:0" as available.
+For SAC automatic entropy tuning, set "target_entropy" to negative action dimension
+(e.g. -2 if action_dim is 2).
+
+Dependencies: torch, gymnasium, numpy, matplotlib; safety tasks need safety-gymnasium;
+PPO video/GIF needs pillow. MuJoCo envs may require MUJOCO_GL (see "mujoco_gl" in PPO JSON).
