@@ -3,15 +3,13 @@ Anonymous supplementary code layout
 
 Files:
   load_config.py              — JSON -> namespace helper
-  sac3.py                     — SAC (former SAC3.py); requires --config
-  ppo2.py                     — PPO; requires --config
-  sac3_config.example.json    — copy and edit all fields for your run
-  ppo2_config.example.json    — same for PPO
+  sac.py                     — SAC (former SAC.py); requires --config
+  ppo.py                     — PPO; requires --config
 
 Run from this directory:
 
-  python sac3.py --config sac3_config.example.json
-  python ppo2.py --config ppo2_config.example.json
+  python sac.py --config sac_config.json
+  python ppo.py --config ppo_config.json
 
 Set "output_dir" in JSON to an empty or new folder for checkpoints and CSV logs.
 Set "device" to "cpu" or "cuda:0" as available.
