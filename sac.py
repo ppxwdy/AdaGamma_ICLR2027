@@ -29,7 +29,7 @@ from load_config import load_config
 cfg = None
 device = None
 directory = None
-script_name = "sac3_submission"
+script_name = "sac"
 LOG_STD_MIN = None
 LOG_STD_MAX = None
 EPSILON = None
@@ -368,7 +368,7 @@ class AdaptiveGammaModule:
         seq = buffer.sample_sequences(cfg.batch_size, n)
         if seq is None:
             return 0.0
-        s_seq, _, r_seq, c_seq, d_seq, ns_last = seq
+        s_seq, _, r_seq, _, d_seq, ns_last = seq
 
         with torch.no_grad():
             a_last, lp_last, _ = policy.sample(ns_last)
@@ -395,23 +395,6 @@ class AdaptiveGammaModule:
         gamma_pred = self.gamma_net(s0)
         one_step = r0 + (1 - d0) * gamma_pred * v1.detach()
         loss_main = (one_step - G_n).pow(2).mean() * cfg.consistency_loss_weight
-        loss_danger = torch.tensor(0.0, device=device)
-        if cfg.danger_aware_gamma:
-            with torch.no_grad():
-                alive = torch.ones(cfg.batch_size, 1, device=device)
-                risk = torch.zeros(cfg.batch_size, 1, device=device)
-                for k in range(n):
-                    risk += alive * c_seq[:, k:k + 1]
-                    alive *= (1 - d_seq[:, k:k + 1])
-                risk_score = 1.0 - torch.exp(-cfg.danger_cost_scale * risk)
-                gate = torch.sigmoid(
-                    (risk_score - cfg.danger_cost_threshold)
-                    / max(cfg.danger_cost_temperature, float(cfg.danger_temperature_floor))
-                )
-                gamma_low = max(self.gamma_min, cfg.danger_gamma_low)
-                gamma_high = min(self.gamma_max, cfg.danger_gamma_high)
-                gamma_target = gamma_high - (gamma_high - gamma_low) * gate
-            loss_danger = F.mse_loss(gamma_pred, gamma_target) * cfg.danger_loss_weight
 
         loss_reg = cfg.gamma_deviation_coef * (gamma_pred - cfg.gamma_default).pow(2).mean()
         loss_var = cfg.gamma_variance_coef * gamma_pred.var() if gamma_pred.numel() > 1 else 0.0
@@ -419,7 +402,7 @@ class AdaptiveGammaModule:
             F.relu(self.gamma_min + float(cfg.gamma_boundary_epsilon) - gamma_pred).mean() +
             F.relu(gamma_pred - self.gamma_max + float(cfg.gamma_boundary_epsilon)).mean()
         )
-        total = loss_main + loss_danger + loss_reg + loss_var + loss_bnd
+        total = loss_main + loss_reg + loss_var + loss_bnd
         self.gamma_optimizer.zero_grad()
         total.backward()
         nn.utils.clip_grad_norm_(self.gamma_net.parameters(), cfg.max_grad_norm)
@@ -975,7 +958,7 @@ class TestModule:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="SAC3 — all hyperparameters via JSON.")
+    parser = argparse.ArgumentParser(description="SAC — all hyperparameters via JSON.")
     parser.add_argument("--config", type=str, required=True, help="Path to JSON config.")
     args = parser.parse_args()
     init_runtime(load_config(args.config))
