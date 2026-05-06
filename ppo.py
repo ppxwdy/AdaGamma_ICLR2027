@@ -36,12 +36,14 @@ from load_config import load_config
 cfg = None
 device = None
 directory = None
-script_name = 'ppo2_submission'
+script_name = 'ppo'
 
 
 def init_runtime(c):
     global cfg, device, directory
     cfg = c
+    if bool(getattr(cfg, 'use_adagamma', False)) and bool(getattr(cfg, 'use_uncertainty_gamma', False)):
+        raise ValueError('config use_adagamma and use_uncertainty_gamma are mutually exclusive')
     if getattr(cfg, 'mujoco_gl', None):
         os.environ['MUJOCO_GL'] = str(cfg.mujoco_gl)
     dev = getattr(cfg, 'device', None)
@@ -160,6 +162,7 @@ class RolloutBuffer:
         self.rewards = []
         self.costs = []
         self.state_values = []
+        self.state_values2 = []  # aux critic for uncertainty_rule; parallel to state_values
         self.is_terminals = []
 
     def clear(self):
@@ -170,6 +173,7 @@ class RolloutBuffer:
         del self.rewards[:]
         del self.costs[:]
         del self.state_values[:]
+        del self.state_values2[:]
         del self.is_terminals[:]
 
 # --------------------------------------
@@ -177,9 +181,11 @@ class RolloutBuffer:
 # --------------------------------------
 
 class ActorCritic(nn.Module):
-    def __init__(self, state_dim, action_dim, has_continuous_action_space, action_std_init, hidden_dim):
+    def __init__(self, state_dim, action_dim, has_continuous_action_space, action_std_init, hidden_dim,
+                 twin_critic=False):
         super(ActorCritic, self).__init__()
         self.has_continuous_action_space = has_continuous_action_space
+        self.twin_critic = twin_critic
 
         if has_continuous_action_space:
             self.action_dim = action_dim
@@ -205,6 +211,12 @@ class ActorCritic(nn.Module):
             nn.Linear(dim, dim), nn.Tanh(),
             nn.Linear(dim, 1)
         )
+        if twin_critic:
+            self.critic2 = nn.Sequential(
+                nn.Linear(state_dim, dim), nn.Tanh(),
+                nn.Linear(dim, dim), nn.Tanh(),
+                nn.Linear(dim, 1)
+            )
 
     def set_action_std(self, new_action_std):
         if self.has_continuous_action_space:
@@ -221,7 +233,9 @@ class ActorCritic(nn.Module):
 
         action = dist.sample()
         action_logprob = dist.log_prob(action)
-        state_val = self.critic(state)
+        v1 = self.critic(state)
+        # twin: main V only for PPO rollout / GAE; critic2 stored separately in buffer.
+        state_val = v1
         return action.detach(), action_logprob.detach(), state_val.detach()
 
     def evaluate(self, state, action):
@@ -238,11 +252,16 @@ class ActorCritic(nn.Module):
 
         action_logprobs = dist.log_prob(action)
         dist_entropy = dist.entropy()
-        state_values = self.critic(state)
-        return action_logprobs, state_values, dist_entropy
+        v1 = self.critic(state)
+        if self.twin_critic:
+            v2 = self.critic2(state)
+        else:
+            v2 = v1
+        state_values = v1
+        return action_logprobs, state_values, v1, v2, dist_entropy
 
 # --------------------------------------
-# 8. PPO Agent with AdaGamma + Danger-Aware Loss
+# 8. PPO Agent with AdaGamma
 # --------------------------------------
 
 class PPO:
@@ -258,18 +277,42 @@ class PPO:
         self.K_epochs = K_epochs
         self.buffer = RolloutBuffer()
 
-        self.policy = ActorCritic(state_dim, action_dim, has_continuous_action_space,
-                                  action_std_init, cfg.actor_hidden_dim).to(device)
-        self.optimizer = torch.optim.Adam([
+        twin = bool(getattr(cfg, 'use_uncertainty_gamma', False))
+        self.policy = ActorCritic(
+            state_dim, action_dim, has_continuous_action_space,
+            action_std_init, cfg.actor_hidden_dim, twin_critic=twin,
+        ).to(device)
+        opt_params = [
             {'params': self.policy.actor.parameters(), 'lr': lr_actor},
-            {'params': self.policy.critic.parameters(), 'lr': lr_critic}
-        ])
+            {'params': self.policy.critic.parameters(), 'lr': lr_critic},
+        ]
+        if twin:
+            opt_params.append({'params': self.policy.critic2.parameters(), 'lr': lr_critic})
+        self.optimizer = torch.optim.Adam(opt_params)
 
-        self.policy_old = ActorCritic(state_dim, action_dim, has_continuous_action_space,
-                                      action_std_init, cfg.actor_hidden_dim).to(device)
+        self.policy_old = ActorCritic(
+            state_dim, action_dim, has_continuous_action_space,
+            action_std_init, cfg.actor_hidden_dim, twin_critic=twin,
+        ).to(device)
         self.policy_old.load_state_dict(self.policy.state_dict())
 
         self.MseLoss = nn.MSELoss()
+
+        if twin:
+            b_init = float(getattr(cfg, 'uncertainty_beta_init', 2.0))
+            init_log = float(np.log(max(b_init, 1e-8)))
+            b_learn = bool(getattr(cfg, 'uncertainty_beta_learnable', True))
+            b_lr = float(getattr(cfg, 'uncertainty_beta_lr', 1e-3))
+            self.log_beta = torch.tensor(
+                init_log,
+                requires_grad=b_learn,
+                device=device,
+                dtype=torch.float32,
+            )
+            self.beta_optimizer = optim.Adam([self.log_beta], lr=b_lr) if b_learn else None
+        else:
+            self.log_beta = None
+            self.beta_optimizer = None
 
         # --- AdaGamma: gamma network (Paper Section 4.1, 5.1) ---
         if cfg.use_adagamma:
@@ -307,11 +350,17 @@ class PPO:
         with torch.no_grad():
             state_tensor = torch.FloatTensor(state).to(device)
             action, action_logprob, state_val = self.policy_old.act(state_tensor)
+            if getattr(cfg, 'use_uncertainty_gamma', False):
+                v2_roll = self.policy_old.critic2(state_tensor)
+            else:
+                v2_roll = None
 
         self.buffer.states.append(state_tensor)
         self.buffer.actions.append(action)
         self.buffer.logprobs.append(action_logprob)
         self.buffer.state_values.append(state_val)
+        if getattr(cfg, 'use_uncertainty_gamma', False):
+            self.buffer.state_values2.append(v2_roll.detach())
 
         if self.has_continuous_action_space:
             return action.detach().cpu().numpy().flatten()
@@ -374,73 +423,22 @@ class PPO:
         returns = advantages + values
         return advantages, returns
 
-    # -------------------------------------------------
-    # Danger-Aware Auxiliary Loss
-    # Paper lines 308-310:
-    #   "danger-aware auxiliary loss that regresses gamma_phi(s)
-    #    toward a risk-conditioned target in [0.92, 0.995]
-    #    computed from short-horizon cost accumulation"
-    # -------------------------------------------------
-    def _compute_danger_target(self, states, costs, is_terminals):
-        """
-        Compute risk-conditioned gamma target per state based on
-        short-horizon cost accumulation.
-
-        For each timestep, accumulate costs in a short forward window.
-        High cost => lower gamma target (more myopic near danger).
-        Low cost => higher gamma target (longer horizon when safe).
-
-        Parameters from paper lines 309-310:
-          scale=2.0, threshold=0.25, temperature=0.10
-          target range: [0.92, 0.995]
-        """
-        T = len(costs)
-        # Short-horizon cost accumulation (look ahead ~10 steps)
-        horizon = min(10, T)
-        cost_accum = torch.zeros(T, device=device)
-
-        # Running backward sum of costs in short window
-        running_cost = 0.0
-        count = 0
-        for t in reversed(range(T)):
-            if is_terminals[t] > 0.5:
-                running_cost = 0.0
-                count = 0
-            running_cost += costs[t]
-            count += 1
-            if count > horizon:
-                running_cost -= costs[min(t + horizon, T - 1)]
-                count = horizon
-            cost_accum[t] = running_cost
-
-        # Normalize cost accumulation
-        cost_normed = cost_accum * cfg.danger_scale
-
-        # Sigmoid mapping: high cost => low gamma target
-        # danger_score in [0, 1], 1 = very dangerous
-        danger_score = torch.sigmoid(
-            (cost_normed - cfg.danger_threshold)
-            / max(cfg.danger_temperature, float(cfg.danger_temperature_floor))
-        )
-
-        # Map danger_score to gamma target: [danger_gamma_high, danger_gamma_low]
-        # danger=0 => gamma_high (safe, long horizon)
-        # danger=1 => gamma_low (dangerous, short horizon)
-        gamma_target = (cfg.danger_gamma_high
-                        - (cfg.danger_gamma_high - cfg.danger_gamma_low) * danger_score)
-
-        return gamma_target
+    def _gamma_from_value_disagreement(self, v1, v2):
+        """γ(s) = γ_max - (γ_max - γ_min) * σ(β |V1-V2|), same as GAMMA/PPO/ppo2.py."""
+        d1 = v1.reshape(-1)
+        d2 = v2.reshape(-1)
+        dis = (d1 - d2).abs()
+        beta = self.log_beta.exp()
+        return cfg.gamma_max - (cfg.gamma_max - cfg.gamma_min) * torch.sigmoid(beta * dis)
 
     # -------------------------------------------------
-    # Return-Consistency + Danger-Aware + Regularization
+    # Return-Consistency + Regularization
     # Paper Section 4.3.2 (Eq. 13), 4.3.4 (Eq. 15-16)
-    # + SafetyPointGoal1-specific danger-aware loss
     # -------------------------------------------------
-    def _compute_gamma_loss(self, states, next_states, rewards, costs, is_terminals):
+    def _compute_gamma_loss(self, states, next_states, rewards, is_terminals):
         """
-        Full gamma network training objective (Eq. 15 + danger-aware):
+        Gamma network training objective (Eq. 15):
           J_gamma(phi) = rc_weight * L^RC(phi)
-                       + danger_weight * L_danger(phi)
                        + lambda_dev * E[(gamma_phi(s) - gamma_target)^2]
                        + lambda_var * Var[gamma_phi(s)]
                        + lambda_bound * L_boundary
@@ -488,12 +486,6 @@ class PPO:
         # --- Return-consistency loss (Eq. 13) ---
         L_rc = ((v_hat_1 - G_n.detach()) ** 2).mean()
 
-        # --- Danger-aware auxiliary loss (Paper lines 308-310) ---
-        L_danger = torch.tensor(0.0, device=device)
-        if cfg.use_danger_aware:
-            danger_gamma_target = self._compute_danger_target(states, costs, is_terminals)
-            L_danger = ((gamma_pred - danger_gamma_target.detach()) ** 2).mean()
-
         # --- Deviation penalty (Eq. 15) ---
         L_dev = ((gamma_pred - cfg.gamma_target) ** 2).mean()
 
@@ -508,7 +500,6 @@ class PPO:
 
         # --- Full objective ---
         total_loss = (cfg.rc_weight * L_rc
-                      + cfg.danger_weight * L_danger
                       + cfg.lambda_dev * L_dev
                       + cfg.lambda_var * L_var
                       + cfg.lambda_bound * L_boundary)
@@ -540,6 +531,9 @@ class PPO:
         old_logprobs = torch.squeeze(torch.stack(self.buffer.logprobs, dim=0)).detach().to(device)
         old_state_values = torch.squeeze(
             torch.stack(self.buffer.state_values, dim=0)).detach().to(device)
+        if getattr(cfg, 'use_uncertainty_gamma', False):
+            old_state_values2 = torch.squeeze(
+                torch.stack(self.buffer.state_values2, dim=0)).detach().to(device)
         next_states = torch.stack(self.buffer.next_states, dim=0).detach().to(device)
 
         rewards_raw = torch.tensor(self.buffer.rewards, dtype=torch.float32).to(device)
@@ -556,7 +550,8 @@ class PPO:
         # Step 1 & 2: Frozen gamma + Modified GAE
         # ============================================================
         with torch.no_grad():
-            next_values = self.policy.critic(next_states).squeeze(-1)
+            v1_next = self.policy.critic(next_states)
+            next_values = v1_next.squeeze(-1)
             next_values = next_values * (1.0 - is_terminals)
 
             if cfg.use_adagamma:
@@ -564,6 +559,19 @@ class PPO:
                     gamma_values = self.gamma_net(old_states).squeeze(-1)
                 else:
                     gamma_values = torch.full_like(rewards, cfg.gamma_max)
+
+                advantages, returns = self.compute_gae_adaptive(
+                    rewards_normalized, old_state_values, next_values,
+                    is_terminals, gamma_values
+                )
+                self.last_avg_gamma = gamma_values.mean().item()
+            elif getattr(cfg, 'use_uncertainty_gamma', False):
+                if episode >= cfg.gamma_warmup_episodes:
+                    v1_old = self.policy.critic(old_states)
+                    v2_old = self.policy.critic2(old_states)
+                    gamma_values = self._gamma_from_value_disagreement(v1_old, v2_old)
+                else:
+                    gamma_values = torch.full_like(rewards, self.gamma)
 
                 advantages, returns = self.compute_gae_adaptive(
                     rewards_normalized, old_state_values, next_values,
@@ -588,8 +596,10 @@ class PPO:
         update_count = 0
 
         for epoch in range(self.K_epochs):
-            logprobs, state_values, dist_entropy = self.policy.evaluate(old_states, old_actions)
+            logprobs, state_values, v1, v2, dist_entropy = self.policy.evaluate(old_states, old_actions)
             state_values = torch.squeeze(state_values)
+            v1 = torch.squeeze(v1)
+            v2 = torch.squeeze(v2)
 
             ratios = torch.exp(logprobs - old_logprobs.detach())
             surr1 = ratios * advantages
@@ -598,12 +608,23 @@ class PPO:
             actor_loss = (-torch.min(surr1, surr2).mean()
                           - cfg.entropy_coef * dist_entropy.mean())
 
-            value_pred_clipped = old_state_values + torch.clamp(
-                state_values - old_state_values, -self.eps_clip, self.eps_clip
-            )
-            value_loss1 = self.MseLoss(state_values, returns)
-            value_loss2 = self.MseLoss(value_pred_clipped, returns)
-            critic_loss = torch.max(value_loss1, value_loss2)
+            if getattr(cfg, 'use_uncertainty_gamma', False):
+                v1_clipped = old_state_values + torch.clamp(
+                    v1 - old_state_values, -self.eps_clip, self.eps_clip
+                )
+                v2_clipped = old_state_values2 + torch.clamp(
+                    v2 - old_state_values2, -self.eps_clip, self.eps_clip
+                )
+                l1 = torch.max(self.MseLoss(v1, returns), self.MseLoss(v1_clipped, returns))
+                l2 = torch.max(self.MseLoss(v2, returns), self.MseLoss(v2_clipped, returns))
+                critic_loss = 0.5 * (l1 + l2)
+            else:
+                value_pred_clipped = old_state_values + torch.clamp(
+                    state_values - old_state_values, -self.eps_clip, self.eps_clip
+                )
+                value_loss1 = self.MseLoss(state_values, returns)
+                value_loss2 = self.MseLoss(value_pred_clipped, returns)
+                critic_loss = torch.max(value_loss1, value_loss2)
 
             loss = actor_loss + float(cfg.critic_loss_coef) * critic_loss
 
@@ -618,12 +639,12 @@ class PPO:
             update_count += 1
 
         # ============================================================
-        # Step 4: Update gamma network (return-consistency + danger-aware)
+        # Step 4: AdaGamma network OR learnable β (twin-V uncertainty)
         # ============================================================
         gamma_loss_val = 0.0
         if cfg.use_adagamma and episode >= cfg.gamma_warmup_episodes:
             gamma_loss, gamma_pred = self._compute_gamma_loss(
-                old_states, next_states, rewards_normalized, costs, is_terminals
+                old_states, next_states, rewards_normalized, is_terminals
             )
             self.optimizer_gamma.zero_grad()
             gamma_loss.backward()
@@ -635,6 +656,23 @@ class PPO:
                     and self.training_step % max(1, cfg.rc_ref_update_every_ppo_updates) == 0):
                 if (not cfg.rc_ref_update_after_warmup) or (episode >= cfg.gamma_warmup_episodes):
                     self.refresh_rc_ref_from_gamma_net(old_states)
+        elif (getattr(cfg, 'use_uncertainty_gamma', False)
+              and bool(getattr(cfg, 'uncertainty_beta_learnable', True))
+              and self.training_step % max(1, int(getattr(cfg, 'uncertainty_gamma_update_freq', 5))) == 0):
+            tgt = float(getattr(cfg, 'uncertainty_target_gamma', 0.99))
+            with torch.no_grad():
+                v1b = self.policy.critic(old_states)
+                v2b = self.policy.critic2(old_states)
+            dis = (v1b.reshape(-1) - v2b.reshape(-1)).abs().detach()
+            gammas_b = (cfg.gamma_max - (cfg.gamma_max - cfg.gamma_min)
+                        * torch.sigmoid(self.log_beta.exp() * dis))
+            b_loss = (gammas_b.mean() - tgt).pow(2)
+            self.beta_optimizer.zero_grad()
+            b_loss.backward()
+            nn.utils.clip_grad_norm_([self.log_beta], cfg.max_grad_norm)
+            self.beta_optimizer.step()
+            gamma_loss_val = b_loss.item()
+            self.last_avg_gamma = gammas_b.mean().item()
 
         # --- Logging ---
         if logger and update_count > 0:
@@ -655,6 +693,7 @@ class PPO:
         model_info = {
             'policy_state_dict': self.policy_old.state_dict(),
             'use_adagamma': cfg.use_adagamma,
+            'use_uncertainty_gamma': bool(getattr(cfg, 'use_uncertainty_gamma', False)),
             'gamma': self.gamma,
             'gamma_min': cfg.gamma_min if cfg.use_adagamma else None,
             'gamma_max': cfg.gamma_max if cfg.use_adagamma else None,
@@ -666,6 +705,12 @@ class PPO:
         if cfg.use_adagamma:
             gamma_path = checkpoint_path.replace('.pth', '_gamma.pth')
             torch.save(self.gamma_net.state_dict(), gamma_path)
+        if getattr(cfg, 'use_uncertainty_gamma', False) and self.log_beta is not None:
+            up = checkpoint_path.replace('.pth', '_uncertainty_beta.pth')
+            payload = {'log_beta': self.log_beta.detach().cpu()}
+            if self.beta_optimizer is not None:
+                payload['beta_opt'] = self.beta_optimizer.state_dict()
+            torch.save(payload, up)
 
     def load(self, checkpoint_path):
         checkpoint = torch.load(checkpoint_path, map_location=lambda storage, loc: storage)
@@ -676,6 +721,7 @@ class PPO:
             print(f"Model Info:")
             print(f"  - Env: {checkpoint.get('env_name', 'Unknown')}")
             print(f"  - AdaGamma: {checkpoint.get('use_adagamma', 'Unknown')}")
+            print(f"  - Uncertainty γ (twin-V): {checkpoint.get('use_uncertainty_gamma', False)}")
             print(f"  - Gamma: {checkpoint.get('gamma', 'Unknown')}")
             print(f"  - Seed: {checkpoint.get('seed', 'Unknown')}")
         else:
@@ -691,6 +737,15 @@ class PPO:
                 print(f"Gamma network loaded from: {gamma_path}")
             else:
                 print("Warning: Gamma network file not found!")
+        if getattr(cfg, 'use_uncertainty_gamma', False) and self.log_beta is not None:
+            up = checkpoint_path.replace('.pth', '_uncertainty_beta.pth')
+            if os.path.exists(up):
+                payload = torch.load(up, map_location=device)
+                b_learn = bool(getattr(cfg, 'uncertainty_beta_learnable', True))
+                self.log_beta = payload['log_beta'].to(device).requires_grad_(b_learn)
+                if self.beta_optimizer is not None and payload.get('beta_opt'):
+                    self.beta_optimizer.load_state_dict(payload['beta_opt'])
+                print(f"Uncertainty β loaded from: {up}")
 
 # --------------------------------------
 # 9. Environment Wrapper for Safety Gymnasium
@@ -774,21 +829,22 @@ def train(ppo_agent, env, csv_logger):
         print(f"run_name: {cfg.run_name}")
     print(f"PPO + AdaGamma Training on {cfg.env_name}")
     print(f"Use AdaGamma: {cfg.use_adagamma}")
+    if getattr(cfg, 'use_uncertainty_gamma', False):
+        print(f"Twin-V uncertainty γ (main V for PPO / aux V for γ(s)): True")
+        print(f"  β init={getattr(cfg, 'uncertainty_beta_init', 2.0)}, "
+              f"learnable={getattr(cfg, 'uncertainty_beta_learnable', True)}, "
+              f"target_mean_γ={getattr(cfg, 'uncertainty_target_gamma', 0.99)}, "
+              f"update_every={int(getattr(cfg, 'uncertainty_gamma_update_freq', 5))} PPO updates")
     if cfg.use_adagamma:
         print(f"Gamma Range: [{cfg.gamma_min}, {cfg.gamma_max}]")
         print(f"Gamma Hidden Dim: {cfg.gamma_hidden_dim}")
         print(f"Gamma Target: {cfg.gamma_target}")
         print(f"Return-Consistency: n={cfg.rc_horizon}, gamma_bar(init)={cfg.rc_ref_init}, "
-              f"adaptive_ref={getattr(Config, 'rc_ref_adaptive', False)}")
-        if getattr(Config, 'rc_ref_adaptive', False):
+              f"adaptive_ref={cfg.rc_ref_adaptive}")
+        if cfg.rc_ref_adaptive:
             print(f"  rc_ref EMA: tau={cfg.rc_ref_ema_tau}, "
                   f"every {max(1, cfg.rc_ref_update_every_ppo_updates)} PPO update(s), "
                   f"after_warmup={cfg.rc_ref_update_after_warmup}")
-        print(f"Danger-Aware Loss: {cfg.use_danger_aware}")
-        if cfg.use_danger_aware:
-            print(f"  weight={cfg.danger_weight}, scale={cfg.danger_scale}, "
-                  f"threshold={cfg.danger_threshold}, temp={cfg.danger_temperature}")
-            print(f"  gamma range: [{cfg.danger_gamma_low}, {cfg.danger_gamma_high}]")
         print(f"Regularization: lambda_dev={cfg.lambda_dev}, "
               f"lambda_var={cfg.lambda_var}, lambda_bound={cfg.lambda_bound}")
         print(f"Warmup Episodes: {cfg.gamma_warmup_episodes}")
@@ -882,10 +938,12 @@ def train(ppo_agent, env, csv_logger):
                               current_ep_cost, running_cost, current_gamma)
 
         if i_episode % cfg.log_interval == 0:
-            warmup_str = (" (warmup)" if cfg.use_adagamma
-                          and i_episode < cfg.gamma_warmup_episodes else "")
-            gamma_str = (f"γ: {current_gamma:.4f}{warmup_str}"
-                         if cfg.use_adagamma else f"γ: {cfg.gamma}")
+            need_warmup = (
+                (cfg.use_adagamma or getattr(cfg, 'use_uncertainty_gamma', False))
+                and i_episode < cfg.gamma_warmup_episodes
+            )
+            warmup_str = " (warmup)" if need_warmup else ""
+            gamma_str = f"γ: {current_gamma:.4f}{warmup_str}"
             cost_flag = " ⚠" if current_ep_cost > cfg.cost_limit else ""
             print(f'Ep {i_episode:4d} | R: {current_ep_reward:7.2f} | '
                   f'Avg R: {running_reward:7.2f} | '
@@ -1155,7 +1213,12 @@ def main():
     # TRAIN MODE
     # =====================
     if cfg.mode == 'train':
-        suffix = '_adagamma' if cfg.use_adagamma else '_fixed_gamma'
+        if cfg.use_adagamma:
+            suffix = '_adagamma'
+        elif getattr(cfg, 'use_uncertainty_gamma', False):
+            suffix = '_uncertainty_gamma'
+        else:
+            suffix = '_fixed_gamma'
         csv_logger = CSVLogger(
             log_dir=directory,
             file1=f'episode_rewards{suffix}_seed_{cfg.random_seed}.csv',
